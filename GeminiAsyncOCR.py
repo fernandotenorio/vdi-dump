@@ -5,6 +5,7 @@ from typing import List, Union
 from google import genai
 from google.genai import types
 from PDFSplitter import split_pdf_by_page_count
+from src.models.job import PartOcrResult
 
 
 def _deident_string(s):
@@ -46,7 +47,7 @@ class GeminiAsyncOCR:
     """
 
     _MAX_OUTPUT_TOKENS: int = 65536
-    _MAX_PAGES_PER_SPLIT: int = 15
+    _MAX_PAGES_PER_SPLIT: int = 7
     _REQUIRED_ENV_VARS = (
         ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
         "GEMINI_MODEL_ID",
@@ -133,10 +134,17 @@ class GeminiAsyncOCR:
             raise
 
 
-    async def run(self, file: io.BytesIO, output_prefix: str = "part") -> str | None:
+   async def run(
+        self, file: io.BytesIO, output_prefix: str = "part"
+    ) -> Tuple[List[PartOcrResult], int] | None:
         """
-        Run OCR on a PDF file, splitting it into parts, processing each part with Gemini model.
-        Returns the concatenated OCR result, or None if splitting fails.
+        Run OCR on a PDF, splitting it and processing each part with the Gemini model.
+
+        Returns:
+            A tuple containing:
+            - A list of PartOcrResult objects.
+            - The total number of tokens consumed.
+            Returns None if the initial splitting fails.
         """
         try:
             parts = split_pdf_by_page_count(
@@ -149,58 +157,79 @@ class GeminiAsyncOCR:
             return None
 
         config = types.GenerateContentConfig(
-            max_output_tokens=self._MAX_OUTPUT_TOKENS // 2,
+            max_output_tokens=self._MAX_OUTPUT_TOKENS,
             temperature=0.1,
             candidate_count=1,
             safety_settings=self.__class__._SAFETY_SETTINGS
         )
-
-        results: list[str] = []
+        
+        part_results: List[PartOcrResult] = []
+        total_tokens = 0
+        part_counter = 1
 
         for filename, pdf_stream in parts:
-            pdf_stream.seek(0)  # ensure beginning of file
+            pdf_stream.seek(0)
 
             try:
                 response = await self.client.models.generate_content(
                     model=self.model_id,
                     contents=[
-                        types.Part.from_bytes(
-                            data=pdf_stream.read(),
-                            mime_type="application/pdf",
-                        ),
+                        types.Part.from_bytes(data=pdf_stream.read(), mime_type="application/pdf"),
                         self.prompt
                     ],
                     config=config
                 )
             except Exception as e:
-                logging.error("Failed to generate OCR for part %s: %s", filename, e, exc_info=True)
+                logging.error(f"Failed to generate OCR for part {part_counter} ({filename}): {e}", exc_info=True)
+                part_counter += 1
                 continue
 
             if not response.candidates:
-                logging.error("OCR Failed: LLM response has no candidates for part %s", filename)
+                logging.error(f"OCR Failed: LLM response has no candidates for part {part_counter} ({filename})")
+                part_counter += 1
                 continue
+            
+            # Use a helper to process the candidate and create the result object
+            result_obj = self._process_candidate(response, part_counter)
+            if result_obj:
+                part_results.append(result_obj)
+                total_tokens += result_obj.token_count
+            
+            part_counter += 1
+        
+        return part_results, total_tokens
 
-            candidate = response.candidates[0]
-            finish_reason = candidate.finish_reason
-
-            if finish_reason != genai.types.FinishReason.STOP:
-                logging.warning(
-                    "Model finished with reason %s for part %s. Attempting to retrieve partial text.",
-                    finish_reason.name,
-                    filename
-                )
-                try:
-                    partial_text = candidate.content.parts[0].text
-                    if partial_text:
-                        results.append(partial_text)
-                except Exception as e:
-                    logging.error("Failed to get partial text from part %s: %s", filename, e, exc_info=True)
-                continue
-
+    def _process_candidate(self, response: types.GenerateContentResponse, part_number: int) -> PartOcrResult | None:
+        """Helper to extract data from a response candidate."""
+        text_result = ""
+        candidate = response.candidates[0]
+        
+        # Handle cases where the model did not finish properly
+        if candidate.finish_reason != genai.types.FinishReason.STOP:
+            logging.warning(
+                "Model finished with reason %s for part %s. Attempting to retrieve partial text.",
+                candidate.finish_reason.name,
+                part_number
+            )
+            try:
+                # Safely access the text part
+                if candidate.content and candidate.content.parts:
+                    text_result = candidate.content.parts[0].text or ""
+            except Exception as e:
+                logging.error(f"Failed to get partial text from part {part_number}: {e}", exc_info=True)
+                return None
+        else:
             # Normal successful case
-            results.append(response.text)
+            text_result = candidate.text
+        
+        tokens_used = response.usage_metadata.total_token_count
 
-        return '\n'.join(results)
+        return PartOcrResult(
+            part_number=part_number,
+            text=text_result,
+            char_count=len(text_result),
+            token_count=tokens_used
+        )
 
 
     async def close(self):
